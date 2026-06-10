@@ -15,6 +15,9 @@ int debugPrintf(char *text, ...);
 
 void cpu_boost(int on);
 
+// loading-screen detection, lives in main.c; called on every buffer swap
+void loading_swap_tick(void);
+
 int ret0(void);
 int ret1(void);
 int retm1(void);

@@ -13,6 +13,7 @@
 #include "config.h"
 #include "util.h"
 #include "jni_fake.h"
+#include "movie_player.h"
 
 #define JNI_OK 0
 #define JNI_VERSION_1_6 0x00010006
@@ -64,7 +65,6 @@ typedef struct {
 volatile int jni_quit_requested = 0;
 
 static int splash_visible = 0;
-static int movie_playing = 0;
 
 void *jni_make_object(const char *label) {
   FakeObject *o = calloc(1, sizeof(*o));
@@ -198,10 +198,8 @@ static FakeID *get_id(const char *name, const char *sig) {
 
 static juint call_boolean(const char *name, va_list va) {
   (void)va;
-  if (!strcmp(name, "isMoviePlaying")) {
-    debugPrintf("JNI: isMoviePlaying -> %d\n", movie_playing);
-    return movie_playing;
-  }
+  if (!strcmp(name, "isMoviePlaying"))
+    return movie_is_playing();
   if (!strcmp(name, "isSplashScreenVisible")) {
     debugPrintf("JNI: isSplashScreenVisible -> %d\n", splash_visible);
     return splash_visible;
@@ -240,18 +238,18 @@ static void call_void(const char *name, va_list va) {
   }
   if (!strcmp(name, "playMovie")) {
     void *path = va_arg(va, void *);
-    movie_playing = 0;
-    debugPrintf("JNI: playMovie(%s) skipped (no movie support yet)\n", obj_str(path));
+    const int skippable = va_arg(va, int);
+    debugPrintf("JNI: playMovie(%s, skippable=%d)\n", obj_str(path), skippable);
+    movie_play(obj_str(path), skippable);
     return;
   }
   if (!strcmp(name, "stopMovie")) {
-    movie_playing = 0;
     debugPrintf("JNI: stopMovie\n");
+    movie_stop();
     return;
   }
   if (!strcmp(name, "pauseMovie")) {
-    (void)va_arg(va, int);
-    debugPrintf("JNI: pauseMovie ignored\n");
+    movie_pause(va_arg(va, int));
     return;
   }
   if (!strncmp(name, "http", 4)) {
@@ -342,7 +340,7 @@ static juint get_boolean_field(const char *name) {
   juint v = 0;
   if (!strcmp(name, "isTvDevice"))    v = 1; // controller-first UI
   if (!strcmp(name, "isPhone"))       v = 0;
-  if (!strcmp(name, "hasTouchScreen"))v = 0; // TODO: touch in handheld mode
+  if (!strcmp(name, "hasTouchScreen"))v = config.touchscreen ? 1 : 0; // panel events fed from main.c
   if (!strcmp(name, "hasVibrator"))   v = 0;
   debugPrintf("JNI: GetBooleanField(%s) -> %d\n", name, (int)v);
   return v;

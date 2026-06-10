@@ -35,6 +35,7 @@ typedef struct {
   int disable_mipmaps;
   int language;
   int crouch_toggle;
+  int touchscreen;
   int character_shadows;
   int drop_highest_lod;
   int show_weapon_menu;

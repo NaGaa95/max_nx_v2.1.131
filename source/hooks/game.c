@@ -60,19 +60,11 @@ int OS_ScreenGetWidth(void) {
   return screen_width;
 }
 
-// game worker threads (sound streaming, loaders) run one priority step above
-// the render loop: HOS does not time-slice equal-priority threads, so a busy
-// frame on the main thread could otherwise starve the music streamer until
-// its OpenAL queue underruns (audible as stuttering). the workers sleep or
-// block on IO most of the time, so they can't starve the renderer.
-#define GAME_THREAD_PRIO 0x2B
-
 static int os_thread_trampoline(void *arg) {
   OSThreadStart *start = arg;
   int (*func)(void *) = start->func;
   void *user_arg = start->arg;
   init_fake_tls(start->tls);
-  svcSetThreadPriority(CUR_THREAD_HANDLE, GAME_THREAD_PRIO);
   const int rc = func(user_arg);
   free(start);
   return rc;
@@ -83,7 +75,6 @@ static int nv_thread_trampoline(void *arg) {
   void *(*func)(void *) = start->func;
   void *user_arg = start->arg;
   init_fake_tls(start->tls);
-  svcSetThreadPriority(CUR_THREAD_HANDLE, GAME_THREAD_PRIO);
   void *rc = func(user_arg);
   free(start);
   return (int)(intptr_t)rc;

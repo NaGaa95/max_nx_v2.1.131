@@ -49,6 +49,7 @@ You're going to need devkitA64 and the following libraries:
 * `switch-libdrm_nouveau`
 * `switch-sdl2`
 * `switch-mpg123`
+* `switch-ffmpeg`
 * `devkitpro-pkgbuild-helpers`
 * [openal-soft](https://github.com/fgsfdsfgs/openal-soft)
 

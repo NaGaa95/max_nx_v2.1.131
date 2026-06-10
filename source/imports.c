@@ -46,6 +46,7 @@
 #include "so_util.h"
 #include "util.h"
 #include "libc_shim.h"
+#include "movie_player.h"
 
 extern uintptr_t __cxa_atexit;
 
@@ -430,7 +431,8 @@ DynLibFunction dynlib_functions[] = {
   { "eglDestroySurface", (uintptr_t)&eglDestroySurface },
   { "eglDestroyContext", (uintptr_t)&eglDestroyContext },
   { "eglMakeCurrent", (uintptr_t)&eglMakeCurrent },
-  { "eglSwapBuffers", (uintptr_t)&eglSwapBuffers },
+  // hooked so the movie player can overlay video frames before each swap
+  { "eglSwapBuffers", (uintptr_t)&eglSwapBuffersHook },
   { "eglSwapInterval", (uintptr_t)&eglSwapInterval },
   { "eglGetError", (uintptr_t)&eglGetError },
   { "eglTerminate", (uintptr_t)&eglTerminate },

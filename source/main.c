@@ -24,6 +24,7 @@
 #include "hooks.h"
 #include "imports.h"
 #include "jni_fake.h"
+#include "movie_player.h"
 
 static void *heap_so_base = NULL;
 static size_t heap_so_limit = 0;
@@ -170,6 +171,9 @@ static void (* implOnGamepadConnected)(void *env, void *cls, int id);
 static void (* implOnGamepadButtonDown)(void *env, void *cls, int id, int keycode);
 static void (* implOnGamepadButtonUp)(void *env, void *cls, int id, int keycode);
 static void (* implOnGamepadAxesChanged)(void *env, void *cls, int id, float lx, float ly, float rx, float ry, float lt, float rt);
+static void (* implOnTouchStart)(void *env, void *cls, int id, float x, float y);
+static void (* implOnTouchMove)(void *env, void *cls, int id, float x, float y);
+static void (* implOnTouchEnd)(void *env, void *cls, int id, float x, float y);
 static void (* implOnNetworkChanged)(void *env, void *cls, int type);
 static void (* implOnHttpRequestError)(void *env, void *cls, int id, int error);
 static void (* implOnRockstarCloudDisabledComplete)(void *env, void *cls);
@@ -197,6 +201,9 @@ static void resolve_entry_points(void) {
   ENTRY(implOnGamepadButtonDown, "implOnGamepadButtonDown");
   ENTRY(implOnGamepadButtonUp, "implOnGamepadButtonUp");
   ENTRY(implOnGamepadAxesChanged, "implOnGamepadAxesChanged");
+  ENTRY(implOnTouchStart, "implOnTouchStart");
+  ENTRY(implOnTouchMove, "implOnTouchMove");
+  ENTRY(implOnTouchEnd, "implOnTouchEnd");
   ENTRY(implOnNetworkChanged, "implOnNetworkChanged");
   ENTRY(implOnHttpRequestError, "implOnHttpRequestError");
   ENTRY(implOnRockstarCloudDisabledComplete, "implOnRockstarCloudDisabledComplete");
@@ -213,6 +220,104 @@ static void resolve_entry_points(void) {
   #undef ENTRY
 }
 
+// ---------------------------------------------------------------------------
+// loading-screen CPU boost: a chapter/savegame load runs entirely inside one
+// long implOnDrawFrame call, but the game keeps presenting its loading
+// screen from within it -- so the eglSwapBuffers hook is the one place that
+// can see a load while it is still running. a swap arriving while the
+// current draw call has already been going for >80ms only happens on
+// loading screens (gameplay frames swap after 16-50ms).
+// ---------------------------------------------------------------------------
+
+static volatile u64 draw_start_tick = 0; // nonzero while inside implOnDrawFrame
+static int load_boosted = 0;
+static u64 load_boost_until = 0;
+
+// called from the eglSwapBuffers hook in movie_player.c
+void loading_swap_tick(void) {
+  const u64 start = draw_start_tick;
+  if (!start)
+    return;
+  const u64 now = armGetSystemTick();
+  const u64 freq = armGetSystemTickFreq();
+  if (now - start > freq / 12) { // current draw running for >~80ms
+    if (!load_boosted) {
+      load_boosted = 1;
+      cpu_boost(1);
+    }
+    // keep boosting while loading frames keep coming; the main loop drops
+    // the boost once the game has been back to normal for a second
+    load_boost_until = now + freq;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// touchscreen (handheld mode): finger states from the panel are translated
+// into the start/move/end events android's view layer used to deliver.
+// libnx reports coordinates in the panel's native 1280x720 space.
+//
+// the engine's UIDraw() skips the on-screen button HUD when the exported
+// "hasJoystick" global is set, so we flip it with whatever input was used
+// last: controller hides the touch HUD, touching the screen brings it back.
+// ---------------------------------------------------------------------------
+
+static uint8_t *ui_has_joystick = NULL; // resolved from libGame.so
+
+static void set_input_mode(int controller) {
+  if (ui_has_joystick && *ui_has_joystick != (uint8_t)controller) {
+    *ui_has_joystick = (uint8_t)controller;
+    debugPrintf("input mode: %s\n", controller ? "controller" : "touch");
+  }
+}
+
+#define MAX_TOUCHES 10
+
+typedef struct {
+  int active;
+  float x, y;
+} TouchSlot;
+
+static TouchSlot touch_prev[MAX_TOUCHES];
+
+static void update_touch(void) {
+  if (!config.touchscreen)
+    return;
+
+  HidTouchScreenState state = { 0 };
+  if (!hidGetTouchScreenStates(&state, 1))
+    return;
+
+  const float sx = (float)screen_width / 1280.0f;
+  const float sy = (float)screen_height / 720.0f;
+
+  int seen[MAX_TOUCHES] = { 0 };
+  for (int i = 0; i < state.count; i++) {
+    const HidTouchState *t = &state.touches[i];
+    const int id = (int)(t->finger_id % MAX_TOUCHES);
+    const float x = (float)t->x * sx;
+    const float y = (float)t->y * sy;
+    seen[id] = 1;
+    if (!touch_prev[id].active) {
+      debugPrintf("touch start %d (%.0f, %.0f)\n", id, x, y);
+      set_input_mode(0);
+      implOnTouchStart(fake_env, NULL, id, x, y);
+    } else if (x != touch_prev[id].x || y != touch_prev[id].y) {
+      implOnTouchMove(fake_env, NULL, id, x, y);
+    }
+    touch_prev[id].active = 1;
+    touch_prev[id].x = x;
+    touch_prev[id].y = y;
+  }
+
+  for (int id = 0; id < MAX_TOUCHES; id++) {
+    if (touch_prev[id].active && !seen[id]) {
+      debugPrintf("touch end %d\n", id);
+      implOnTouchEnd(fake_env, NULL, id, touch_prev[id].x, touch_prev[id].y);
+      touch_prev[id].active = 0;
+    }
+  }
+}
+
 static PadState pad;
 static u64 pad_prev = 0;
 
@@ -225,7 +330,10 @@ static void update_gamepad(void) {
     if (changed & pad_map[i].hid) {
       if (down & pad_map[i].hid) {
         debugPrintf("gamepad button down %d\n", pad_map[i].button);
+        set_input_mode(1);
         implOnGamepadButtonDown(fake_env, NULL, 0, pad_map[i].button);
+        // the game ignores input while waiting for a movie
+        movie_skip();
       } else {
         debugPrintf("gamepad button up %d\n", pad_map[i].button);
         implOnGamepadButtonUp(fake_env, NULL, 0, pad_map[i].button);
@@ -357,6 +465,7 @@ int main(void) {
   int (* JNI_OnLoad)(void *vm, void *reserved) = (void *)so_find_addr_rx(&game_mod, "JNI_OnLoad");
   void (* NVThreadInit)(void *vm) = (void *)so_find_addr_rx(&game_mod, "_Z12NVThreadInitP7_JavaVM");
   void (* ShowJoystick)(int show) = (void *)so_find_addr_rx(&game_mod, "_Z12ShowJoystickb");
+  ui_has_joystick = (uint8_t *)so_find_addr_rx(&game_mod, "hasJoystick");
 
   so_finalize(&cxx_mod);
   so_finalize(&game_mod);
@@ -405,12 +514,16 @@ int main(void) {
 
   padConfigureInput(8, HidNpadStyleSet_NpadStandard);
   padInitializeAny(&pad);
+  hidInitializeTouchScreen();
   implOnGamepadConnected(fake_env, NULL, 0);
 
   debugPrintf("implOnResume\n");
   implOnResume(fake_env, NULL);
 
   ShowJoystick(0);
+  // start in controller mode: the touch button HUD stays hidden until the
+  // screen is actually touched
+  set_input_mode(1);
 
   debugPrintf("implIsInitialized = %d\n", implIsInitialized(fake_env, NULL));
 
@@ -428,6 +541,7 @@ int main(void) {
     dispatch_rockstar_events();
 
     update_gamepad();
+    update_touch();
 
     const u64 now = armGetSystemTick();
     float dt = (float)(now - last_tick) / (float)tick_freq;
@@ -435,17 +549,29 @@ int main(void) {
     if (dt <= 0.0f || dt > 0.5f)
       dt = 1.0f / 60.0f;
 
+    draw_start_tick = armGetSystemTick();
     implOnDrawFrame(fake_env, NULL, dt);
+    draw_start_tick = 0;
 
-    // the heavy boot loading happens inside the first few draw frames;
-    // once the menu is up, return to normal clocks
-    if (boot_frames < 10 && ++boot_frames == 10)
+    // keeps movie playback going when the game stops rendering during it
+    movie_main_loop_tick();
+
+    if (boot_frames < 10) {
+      // the heavy boot loading happens inside the first few draw frames;
+      // once the menu is up, return to normal clocks
+      if (++boot_frames == 10)
+        cpu_boost(0);
+    } else if (load_boosted && armGetSystemTick() > load_boost_until) {
+      // the loading screen ended (see loading_swap_tick)
+      load_boosted = 0;
       cpu_boost(0);
+    }
   }
 
   debugPrintf("shutting down\n");
   implOnPause(fake_env, NULL);
 
+  movie_stop();
   deinit_openal();
 
   extern void NX_NORETURN __libnx_exit(int rc);

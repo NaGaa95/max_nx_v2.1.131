@@ -21,6 +21,7 @@
   CONFIG_VAR_INT(disable_mipmaps); \
   CONFIG_VAR_INT(language); \
   CONFIG_VAR_INT(crouch_toggle); \
+  CONFIG_VAR_INT(touchscreen); \
   CONFIG_VAR_INT(character_shadows); \
   CONFIG_VAR_INT(drop_highest_lod); \
   CONFIG_VAR_INT(show_weapon_menu); \
@@ -55,6 +56,7 @@ int read_config(const char *file) {
   config.disable_mipmaps = 0;
   config.language = 0; // english
   config.crouch_toggle = 1;
+  config.touchscreen = 1; // handheld touch input
   config.character_shadows = 1; // 1 - one blob; 2 - foot shadows
   config.drop_highest_lod = 0; // does this even do anything?
   config.show_weapon_menu = 0;
