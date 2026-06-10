@@ -65,6 +65,12 @@ int debugPrintf(char *text, ...) {
   return 0;
 }
 
+// boost the CPU to 1785MHz while loading (errors ignored: needs 7.0.0+
+// and application mode, older setups just stay at the normal clocks)
+void cpu_boost(int on) {
+  appletSetCpuBoostMode(on ? ApmCpuBoostMode_FastLoad : ApmCpuBoostMode_Normal);
+}
+
 int ret0(void) { return 0; }
 
 int ret1(void) { return 1; }

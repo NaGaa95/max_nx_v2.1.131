@@ -12,10 +12,15 @@
 // should be enough for pretend purposes
 #define MEMORY_MB 512
 
-#define SO_NAME "libMaxPayne.so"
+// 2.1.131 ships the game as libGame.so and dynamically links the C++
+// runtime, which we load as a second module
+#define SO_NAME "libGame.so"
+#define CXX_SO_NAME "libc++_shared.so"
 #define CONFIG_NAME "config.txt"
 #define LOG_NAME "debug.log"
 
+// per-line SD card writes make this cost several seconds of boot time;
+// re-enable only when investigating a crash or misbehavior
 // #define DEBUG_LOG 1
 
 // actual screen size

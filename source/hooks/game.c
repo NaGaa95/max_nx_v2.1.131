@@ -4,6 +4,10 @@
  *
  * This software may be modified and distributed under the terms
  * of the MIT license.  See the LICENSE file for details.
+ *
+ * 2.1.131 update: most of the old NVIDIA-era hooks are gone because their
+ * targets no longer exist. The platform layer is now serviced through the
+ * fake JNI environment (jni_fake.c); only engine-level patches remain here.
  */
 
 #include <stdlib.h>
@@ -19,54 +23,34 @@
 #include "../util.h"
 #include "../so_util.h"
 #include "../hooks.h"
+#include "../jni_fake.h"
 
-#define APK_PATH "main.obb"
+extern so_module game_mod; // defined in main.c
 
-extern uintptr_t __cxa_guard_acquire;
-extern uintptr_t __cxa_guard_release;
-extern uintptr_t __cxa_throw;
+typedef struct {
+  int (*func)(void *);
+  void *arg;
+  uint8_t tls[0x100];
+} OSThreadStart;
 
-static int *deviceChip;
-static int *deviceForm;
-static int *definedDevice;
+typedef struct {
+  void *(*func)(void *);
+  void *arg;
+  uint8_t tls[0x100];
+} NVThreadStart;
 
-static PadState pad;
+static uint8_t main_fake_tls[0x100];
 
-static uint8_t fake_tls[0x100];
+static void init_fake_tls(uint8_t *tls) {
+  memset(tls, 0, 0x100);
+  armSetTlsRw(tls);
+}
 
 // control binding array
 typedef struct {
   int unk[14];
 } MaxPayne_InputControl;
 static MaxPayne_InputControl *sm_control = NULL; // [32]
-
-int NvAPKOpen(const char *path) {
-  // debugPrintf("NvAPKOpen: %s\n", path);
-  return 0;
-}
-
-int ProcessEvents(void) {
-  return 0; // 1 is exit!
-}
-
-int AND_DeviceType(void) {
-  // 0x1: phone
-  // 0x2: tegra
-  // low memory is < 256
-  return (MEMORY_MB << 6) | (3 << 2) | 0x2;
-}
-
-int AND_DeviceLocale(void) {
-  return 0; // english
-}
-
-int AND_SystemInitialize(void) {
-  // set device information in such a way that bloom isn't enabled
-  *deviceForm = 1; // phone
-  *deviceChip = 14; // some tegra? tegras are 12, 13, 14
-  *definedDevice = 27; // some tegra?
-  return 0;
-}
 
 int OS_ScreenGetHeight(void) {
   return screen_height;
@@ -76,160 +60,78 @@ int OS_ScreenGetWidth(void) {
   return screen_width;
 }
 
-char *OS_FileGetArchiveName(int mode) {
-  char *out = malloc(strlen(APK_PATH) + 1);
-  out[0] = '\0';
-  if (mode == 1) // main
-    strcpy(out, APK_PATH);
-  return out;
+// game worker threads (sound streaming, loaders) run one priority step above
+// the render loop: HOS does not time-slice equal-priority threads, so a busy
+// frame on the main thread could otherwise starve the music streamer until
+// its OpenAL queue underruns (audible as stuttering). the workers sleep or
+// block on IO most of the time, so they can't starve the renderer.
+#define GAME_THREAD_PRIO 0x2B
+
+static int os_thread_trampoline(void *arg) {
+  OSThreadStart *start = arg;
+  int (*func)(void *) = start->func;
+  void *user_arg = start->arg;
+  init_fake_tls(start->tls);
+  svcSetThreadPriority(CUR_THREAD_HANDLE, GAME_THREAD_PRIO);
+  const int rc = func(user_arg);
+  free(start);
+  return rc;
 }
 
-void ExitAndroidGame(int code) {
-  // deinit openal
-  deinit_openal();
-  // deinit EGL
-  deinit_opengl();
-  // unmap lib
-  so_unload();
-  // die
-  // exit(0); // doesn't actually exit?
-  extern void NX_NORETURN __libnx_exit(int rc);
-  __libnx_exit(0);
+static int nv_thread_trampoline(void *arg) {
+  NVThreadStart *start = arg;
+  void *(*func)(void *) = start->func;
+  void *user_arg = start->arg;
+  init_fake_tls(start->tls);
+  svcSetThreadPriority(CUR_THREAD_HANDLE, GAME_THREAD_PRIO);
+  void *rc = func(user_arg);
+  free(start);
+  return (int)(intptr_t)rc;
 }
 
-// this is supposed to allocate and return a thread handle struct, but the game never uses it
-// and never frees it, so we just return a pointer to some static garbage
+// this is supposed to allocate and return a thread handle struct, but the game
+// only uses it as an opaque handle. Keep a small static placeholder, and run the
+// target through a trampoline so TPIDR_EL0 is valid on game-created threads.
 void *OS_ThreadLaunch(int (* func)(void *), void *arg, int r2, char *name, int r4, int priority) {
+  (void)r2; (void)r4; (void)priority;
   static char buf[0x80];
+  debugPrintf("OS_ThreadLaunch: %s\n", name ? name : "(unnamed)");
+  OSThreadStart *start = calloc(1, sizeof(*start));
+  if (!start)
+    return NULL;
+  start->func = func;
+  start->arg = arg;
   thrd_t thrd;
-  thrd_create(&thrd, func, arg);
+  if (thrd_create(&thrd, os_thread_trampoline, start) != thrd_success) {
+    free(start);
+    return NULL;
+  }
   return buf;
 }
 
-int ReadDataFromPrivateStorage(const char *file, void **data, int *size) {
-  debugPrintf("ReadDataFromPrivateStorage %s\n", file);
-
-  FILE *f = fopen(file, "rb");
-  if (!f) return 0;
-
-  fseek(f, 0, SEEK_END);
-  const int sz = ftell(f);
-  fseek(f, 0, SEEK_SET);
-
-  int ret = 0;
-
-  if (sz > 0) {
-    void *buf = malloc(sz);
-    if (buf && fread(buf, sz, 1, f)) {
-      ret = 1;
-      *size = sz;
-      *data = buf;
-    } else {
-      free(buf);
-    }
+// the game spawns its loader/sound threads through this NVThread wrapper now
+int NVThreadSpawnJNIThread(long *tid, const void *attr, const char *name, void *(*fn)(void *), void *arg) {
+  (void)attr;
+  debugPrintf("NVThreadSpawnJNIThread: %s\n", name ? name : "(unnamed)");
+  NVThreadStart *start = calloc(1, sizeof(*start));
+  if (!start)
+    return -1;
+  start->func = fn;
+  start->arg = arg;
+  thrd_t thrd;
+  if (thrd_create(&thrd, nv_thread_trampoline, start) != thrd_success) {
+    free(start);
+    return -1;
   }
-
-  fclose(f);
-
-  return ret;
-}
-
-int WriteDataToPrivateStorage(const char *file, const void *data, int size) {
-  debugPrintf("WriteDataToPrivateStorage %s\n", file);
-
-  FILE *f = fopen(file, "wb");
-  if (!f) return 0;
-
-  const int ret = fwrite(data, size, 1, f);
-  fclose(f);
-
-  return ret;
-}
-
-// 0, 5, 6: XBOX 360
-// 4: MogaPocket
-// 7: MogaPro
-// 8: PS3
-// 9: IOSExtended
-// 10: IOSSimple
-int WarGamepad_GetGamepadType(int padnum) {
+  if (tid)
+    *tid = (long)thrd;
   return 0;
 }
 
-int WarGamepad_GetGamepadButtons(int padnum) {
-  int mask = 0;
-
-  // this is called first, so we call update here
-  padUpdate(&pad);
-  const u32 kdown = padGetButtons(&pad);
-
-  if (kdown & HidNpadButton_A)
-    mask |= 0x1;
-  if (kdown & HidNpadButton_B)
-    mask |= 0x2;
-  if (kdown & HidNpadButton_X)
-    mask |= 0x4;
-  if (kdown & HidNpadButton_Y)
-    mask |= 0x8;
-  if (kdown & HidNpadButton_Plus)
-    mask |= 0x10;
-  if (kdown & HidNpadButton_Minus)
-    mask |= 0x20;
-  if (kdown & HidNpadButton_L)
-    mask |= 0x40;
-  if (kdown & HidNpadButton_R)
-    mask |= 0x80;
-  if (kdown & HidNpadButton_Up)
-    mask |= 0x100;
-  if (kdown & HidNpadButton_Down)
-    mask |= 0x200;
-  if (kdown & HidNpadButton_Left)
-    mask |= 0x400;
-  if (kdown & HidNpadButton_Right)
-    mask |= 0x800;
-  if (kdown & HidNpadButton_StickL)
-    mask |= 0x1000;
-  if (kdown & HidNpadButton_StickR)
-    mask |= 0x2000;
-
-  return mask;
-}
-
-float WarGamepad_GetGamepadAxis(int padnum, int axis) {
-  const float scale = 1.f / (float)0x7fff;
-  const u32 kdown = padGetButtonsDown(&pad);
-  const HidAnalogStickState sticks[2] = {
-    padGetStickPos(&pad, 0),
-    padGetStickPos(&pad, 1)
-  };
-
-  float val = 0.0f;
-
-  switch (axis) {
-    case 0:
-      val = (float)sticks[0].x * scale;
-      break;
-    case 1:
-      val = (float)sticks[0].y * -scale;
-      break;
-    case 2:
-      val = (float)sticks[1].x * scale;
-      break;
-    case 3:
-      val = (float)sticks[1].y * -scale;
-      break;
-    case 4: // LT
-      val = (kdown & HidNpadButton_ZL) ? 1.0f : 0.0f;
-      break;
-    case 5: // RT
-      val = (kdown & HidNpadButton_ZR) ? 1.0f : 0.0f;
-      break;
-  }
-
-  if (fabsf(val) > 0.2f)
-    return val;
-
-  return 0.0f;
+// always hand out our fake JNIEnv; the real one TLS-caches a env pointer
+// that we can't provide
+void *NVThreadGetCurrentJNIEnv(void) {
+  return fake_env;
 }
 
 static int (* MaxPayne_InputControl_getButton)(MaxPayne_InputControl *, int);
@@ -244,33 +146,6 @@ int MaxPayne_ConfiguredInput_readCrouch(void *this) {
     if (new) latch = !latch;
   }
   return latch;
-}
-
-int GetAndroidCurrentLanguage(void) {
-  // this will be loaded from config.txt; cap it
-  if (config.language < 0 || config.language > 6)
-    config.language = 0; // english
-  return config.language;
-}
-
-void SetAndroidCurrentLanguage(int lang) {
-  if (config.language != lang) {
-    // changed; save config
-    config.language = lang;
-    write_config(CONFIG_NAME);
-  }
-}
-
-static int (* R_File_loadArchives)(void *this);
-static void (* R_File_unloadArchives)(void *this);
-static void (* R_File_enablePriorityArchive)(void *this, const char *arc);
-
-int R_File_setFileSystemRoot(void *this, const char *root) {
-  // root appears to be unused?
-  R_File_unloadArchives(this);
-  const int res = R_File_loadArchives(this);
-  R_File_enablePriorityArchive(this, config.mod_file);
-  return res;
 }
 
 int X_DetailLevel_getCharacterShadows(void) {
@@ -289,101 +164,58 @@ float X_DetailLevel_getDebrisProjectileLimitMultiplier(void) {
   return config.debris_limit;
 }
 
-int64_t UseBloom(void) {
-  return config.use_bloom;
-}
-
 void patch_game(void) {
-  // configure our supported input layout: all players with standard controller styles
-  padConfigureInput(8, HidNpadStyleSet_NpadStandard);
-  // initialize the gamepad for reading all controllers
-  padInitializeAny(&pad);
+  // route JNIEnv access through the fake environment
+  hook_arm64(so_find_addr(&game_mod, "_Z24NVThreadGetCurrentJNIEnvv"), (uintptr_t)NVThreadGetCurrentJNIEnv);
+  hook_arm64(so_find_addr(&game_mod, "_Z22NVThreadSpawnJNIThreadPlPK14pthread_attr_tPKcPFPvS5_ES5_"), (uintptr_t)NVThreadSpawnJNIThread);
 
-  // make it crash in an obvious location when it calls JNI methods
-  hook_arm64(so_find_addr("_Z24NVThreadGetCurrentJNIEnvv"), (uintptr_t)0x1337);
+  hook_arm64(so_find_addr(&game_mod, "_Z15OS_ThreadLaunchPFjPvES_jPKci16OSThreadPriority"), (uintptr_t)OS_ThreadLaunch);
 
-  hook_arm64(so_find_addr("__cxa_throw"), (uintptr_t)&__cxa_throw);
-  hook_arm64(so_find_addr("__cxa_guard_acquire"), (uintptr_t)&__cxa_guard_acquire);
-  hook_arm64(so_find_addr("__cxa_guard_release"), (uintptr_t)&__cxa_guard_release);
-
-  hook_arm64(so_find_addr("_Z15OS_ThreadLaunchPFjPvES_jPKci16OSThreadPriority"), (uintptr_t)OS_ThreadLaunch);
-
-  // used to check some flags
-  hook_arm64(so_find_addr("_Z20OS_ServiceAppCommandPKcS0_"), (uintptr_t)ret0);
-  hook_arm64(so_find_addr("_Z23OS_ServiceAppCommandIntPKci"), (uintptr_t)ret0);
-  // this is checked on startup
-  hook_arm64(so_find_addr("_Z25OS_ServiceIsWifiAvailablev"), (uintptr_t)ret0);
-  hook_arm64(so_find_addr("_Z28OS_ServiceIsNetworkAvailablev"), (uintptr_t)ret0);
-  // don't bother opening links
-  hook_arm64(so_find_addr("_Z18OS_ServiceOpenLinkPKc"), (uintptr_t)ret0);
-
-  // don't have movie playback yet
-  hook_arm64(so_find_addr("_Z12OS_MoviePlayPKcbbf"), (uintptr_t)ret0);
-  hook_arm64(so_find_addr("_Z12OS_MovieStopv"), (uintptr_t)ret0);
-  hook_arm64(so_find_addr("_Z20OS_MovieSetSkippableb"), (uintptr_t)ret0);
-  hook_arm64(so_find_addr("_Z17OS_MovieTextScalei"), (uintptr_t)ret0);
-  hook_arm64(so_find_addr("_Z17OS_MovieIsPlayingPi"), (uintptr_t)ret0);
-  hook_arm64(so_find_addr("_Z20OS_MoviePlayinWindowPKciiiibbf"), (uintptr_t)ret0);
-
-  hook_arm64(so_find_addr("_Z17OS_ScreenGetWidthv"), (uintptr_t)OS_ScreenGetWidth);
-  hook_arm64(so_find_addr("_Z18OS_ScreenGetHeightv"), (uintptr_t)OS_ScreenGetHeight);
-
-  hook_arm64(so_find_addr("_Z9NvAPKOpenPKc"), (uintptr_t)ret0);
-
-  // TODO: implement touch here
-  hook_arm64(so_find_addr("_Z13ProcessEventsb"), (uintptr_t)ProcessEvents);
-
-  // both set and get are called, remember the language that it sets
-  hook_arm64(so_find_addr("_Z25GetAndroidCurrentLanguagev"), (uintptr_t)GetAndroidCurrentLanguage);
-  hook_arm64(so_find_addr("_Z25SetAndroidCurrentLanguagei"), (uintptr_t)SetAndroidCurrentLanguage);
-
-  hook_arm64(so_find_addr("_Z14AND_DeviceTypev"), (uintptr_t)AND_DeviceType);
-  hook_arm64(so_find_addr("_Z16AND_DeviceLocalev"), (uintptr_t)AND_DeviceLocale);
-  hook_arm64(so_find_addr("_Z20AND_SystemInitializev"), (uintptr_t)AND_SystemInitialize);
-  hook_arm64(so_find_addr("_Z21AND_ScreenSetWakeLockb"), (uintptr_t)ret0);
-  hook_arm64(so_find_addr("_Z22AND_FileGetArchiveName13OSFileArchive"), (uintptr_t)OS_FileGetArchiveName);
-
-  hook_arm64(so_find_addr("_Z26ReadDataFromPrivateStoragePKcRPcRi"), (uintptr_t)ReadDataFromPrivateStorage);
-  hook_arm64(so_find_addr("_Z25WriteDataToPrivateStoragePKcS0_i"), (uintptr_t)WriteDataToPrivateStorage);
-
-  hook_arm64(so_find_addr("_Z25WarGamepad_GetGamepadTypei"), (uintptr_t)WarGamepad_GetGamepadType);
-  hook_arm64(so_find_addr("_Z28WarGamepad_GetGamepadButtonsi"), (uintptr_t)WarGamepad_GetGamepadButtons);
-  hook_arm64(so_find_addr("_Z25WarGamepad_GetGamepadAxisii"), (uintptr_t)WarGamepad_GetGamepadAxis);
-
-  // no vibration of any kind
-  hook_arm64(so_find_addr("_Z12VibratePhonei"), (uintptr_t)ret0);
-  hook_arm64(so_find_addr("_Z14Mobile_Vibratei"), (uintptr_t)ret0);
-
-  hook_arm64(so_find_addr("_Z15ExitAndroidGamev"), (uintptr_t)ExitAndroidGame);
+  hook_arm64(so_find_addr(&game_mod, "_Z17OS_ScreenGetWidthv"), (uintptr_t)OS_ScreenGetWidth);
+  hook_arm64(so_find_addr(&game_mod, "_Z18OS_ScreenGetHeightv"), (uintptr_t)OS_ScreenGetHeight);
 
   // hook detail level getters to our own settings
-  hook_arm64(so_find_addr("_ZN13X_DetailLevel19getCharacterShadowsEv"), (uintptr_t)X_DetailLevel_getCharacterShadows);
-  hook_arm64(so_find_addr("_ZN13X_DetailLevel34getDebrisProjectileLimitMultiplierEv"), (uintptr_t)X_DetailLevel_getDebrisProjectileLimitMultiplier);
-  hook_arm64(so_find_addr("_ZN13X_DetailLevel23getDecalLimitMultiplierEv"), (uintptr_t)X_DetailLevel_getDecalLimitMultiplier);
-  hook_arm64(so_find_addr("_ZN13X_DetailLevel13dropHighesLODEv"), (uintptr_t)X_DetailLevel_getDropHighestLOD);
+  hook_arm64(so_find_addr(&game_mod, "_ZN13X_DetailLevel19getCharacterShadowsEv"), (uintptr_t)X_DetailLevel_getCharacterShadows);
+  hook_arm64(so_find_addr(&game_mod, "_ZN13X_DetailLevel34getDebrisProjectileLimitMultiplierEv"), (uintptr_t)X_DetailLevel_getDebrisProjectileLimitMultiplier);
+  hook_arm64(so_find_addr(&game_mod, "_ZN13X_DetailLevel23getDecalLimitMultiplierEv"), (uintptr_t)X_DetailLevel_getDecalLimitMultiplier);
+  hook_arm64(so_find_addr(&game_mod, "_ZN13X_DetailLevel13dropHighesLODEv"), (uintptr_t)X_DetailLevel_getDropHighestLOD);
 
-  // force bloom to our config value
-  hook_arm64(so_find_addr("_Z8UseBloomv"), (uintptr_t)UseBloom);
+  // UseBloom() gates the whole post-process pipeline. Stock 2.1.131
+  // hardcodes it to "return 1" (pipeline always on) and the in-game
+  // "Enhanced Contrast" toggle (Get/SetPostProcessToggle) only picks the
+  // contrast math in the composite pass. Forcing it to 0 makes the toggle
+  // render the scene into bloom buffers that were never created -> black
+  // screen with only the HUD visible.
+  //
+  // use_bloom=1: keep stock behavior (pipeline always on, like android).
+  // use_bloom=0 (default): tie the pipeline to the in-game toggle, so it
+  // only costs anything when Enhanced Contrast is actually enabled.
+  // PostProcessTick polls UseBloom() every frame and creates/deletes the
+  // buffers on a state change, so redirecting the getter is enough.
+  //
+  // NOTE: UseBloom is only 8 bytes and is immediately followed by
+  // PostProcessTick, so a normal 16-byte hook would corrupt the next
+  // function; a single branch instruction fits.
+  if (!config.use_bloom) {
+    uint32_t *use_bloom = (uint32_t *)so_find_addr(&game_mod, "_Z8UseBloomv");
+    const uint32_t *get_toggle = (uint32_t *)so_find_addr(&game_mod, "_Z20GetPostProcessTogglev");
+    const int64_t off = (get_toggle - use_bloom); // in instructions
+    use_bloom[0] = 0x14000000u | ((uint32_t)off & 0x3FFFFFFu); // b GetPostProcessToggle
+  }
 
   // dummy out the weapon menu arrow drawer if it's disabled
   if (!config.show_weapon_menu)
-    hook_arm64(so_find_addr("_ZN12WeaponSwiper4DrawEv"), (uintptr_t)ret0);
+    hook_arm64(so_find_addr(&game_mod, "_ZN12WeaponSwiper4DrawEv"), (uintptr_t)ret0);
 
   // crouch toggle
   if (config.crouch_toggle) {
-    sm_control = (void *)so_find_addr_rx("_ZN24MaxPayne_ConfiguredInput10sm_controlE");
-    MaxPayne_InputControl_getButton = (void *)so_find_addr_rx("_ZNK21MaxPayne_InputControl9getButtonEi");
-    hook_arm64(so_find_addr("_ZNK24MaxPayne_ConfiguredInput10readCrouchEv"), (uintptr_t)MaxPayne_ConfiguredInput_readCrouch);
+    sm_control = (void *)so_find_addr_rx(&game_mod, "_ZN24MaxPayne_ConfiguredInput10sm_controlE");
+    MaxPayne_InputControl_getButton = (void *)so_find_addr_rx(&game_mod, "_ZNK21MaxPayne_InputControl9getButtonEi");
+    hook_arm64(so_find_addr(&game_mod, "_ZNK24MaxPayne_ConfiguredInput10readCrouchEv"), (uintptr_t)MaxPayne_ConfiguredInput_readCrouch);
   }
 
-  // if mod file is enabled, hook into R_File::setFileSystemRoot to set the mod as the priority archive
-  // before R_File::loadArchives is called
-  if (config.mod_file[0]) {
-    R_File_unloadArchives = (void *)so_find_addr_rx("_ZN6R_File14unloadArchivesEv");
-    R_File_loadArchives = (void *)so_find_addr_rx("_ZN6R_File12loadArchivesEv");
-    R_File_enablePriorityArchive = (void *)so_find_addr_rx("_ZN6R_File21enablePriorityArchiveEPKc");
-    hook_arm64(so_find_addr("_ZN6R_File17setFileSystemRootEPKc"), (uintptr_t)R_File_setFileSystemRoot);
-  }
+  // NOTE: the mod file (priority archive) feature from 1.7 is gone for now:
+  // R_File::setFileSystemRoot / enablePriorityArchive don't exist in 2.1.131
 
   // HACK: THIS IS POSSIBLY VERY BAD
   // the game uses some sort of a stack guard mechanism that reads an offset from TPIDR_EL0,
@@ -391,10 +223,10 @@ void patch_game(void) {
   // however on the Switch TPIDR_EL0 seems to just return 0 (armGetTls() uses TPIDRRO_EL0)
   // I don't know whether this will cause any issues or not, but we just write a pointer to
   // a static buffer to TPIDR_EL0 and let the game use that
-  armSetTlsRw(fake_tls);
+  init_fake_tls(main_fake_tls);
 
-  // vars used in AND_SystemInitialize
-  deviceChip = (int *)so_find_addr_rx("deviceChip");
-  deviceForm = (int *)so_find_addr_rx("deviceForm");
-  definedDevice = (int *)so_find_addr_rx("definedDevice");
+  // RGB565 FBOs suck
+  *(uint8_t *)so_find_addr(&game_mod, "UseRGBA8") = 1;
+  // hide the touch joystick overlay
+  *(uint8_t *)so_find_addr(&game_mod, "showJoysticks") = 0;
 }

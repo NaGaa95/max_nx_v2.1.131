@@ -13,6 +13,8 @@
 
 int debugPrintf(char *text, ...);
 
+void cpu_boost(int on);
+
 int ret0(void);
 int ret1(void);
 int retm1(void);

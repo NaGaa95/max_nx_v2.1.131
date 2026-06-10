@@ -10,32 +10,65 @@
 #define __SO_UTIL_H__
 
 #include <stdint.h>
+#include <stddef.h>
+#include <elf.h>
 
 #define ALIGN_MEM(x, align) (((x) + ((align) - 1)) & ~((align) - 1))
+
+#define SO_MAX_SEGMENTS 8
 
 typedef struct {
   char *symbol;
   uintptr_t func;
 } DynLibFunction;
 
-extern void *text_base, *data_base;
-extern size_t text_size, data_size;
+typedef struct so_module {
+  struct so_module *next;
+  char name[64];
+
+  // entire LOAD zone
+  void *load_base, *load_virtbase;
+  size_t load_size;
+  void *load_memrv; // VirtmemReservation *
+
+  // copy of the unmodified program headers (link-time vaddrs),
+  // needed for dl_iterate_phdr / exception unwinding
+  Elf64_Phdr phdr[SO_MAX_SEGMENTS * 2];
+  int phnum;
+
+  // temporary file image
+  void *so_base;
+  size_t so_size;
+
+  Elf64_Ehdr *elf_hdr;
+  Elf64_Phdr *prog_hdr;
+  Elf64_Shdr *sec_hdr;
+  Elf64_Sym *syms;
+  int num_syms;
+  char *shstrtab;
+  char *dynstrtab;
+} so_module;
 
 void hook_thumb(uintptr_t addr, uintptr_t dst);
 void hook_arm(uintptr_t addr, uintptr_t dst);
 void hook_arm64(uintptr_t addr, uintptr_t dst);
 
-void so_flush_caches(void);
-void so_free_temp(void);
-int so_load(const char *filename, void *base, size_t max_size);
-int so_relocate(void);
-int so_resolve(DynLibFunction *funcs, int num_funcs, int taint_missing_imports);
-void so_execute_init_array(void);
-uintptr_t so_find_addr(const char *symbol);
-uintptr_t so_find_addr_rx(const char *symbol);
-uintptr_t so_find_rel_addr(const char *symbol);
+void so_flush_caches(so_module *mod);
+void so_free_temp(so_module *mod);
+int so_load(so_module *mod, const char *filename, void *base, size_t max_size);
+int so_relocate(so_module *mod);
+int so_resolve(so_module *mod, DynLibFunction *funcs, int num_funcs, int taint_missing_imports);
+void so_execute_init_array(so_module *mod);
+uintptr_t so_find_addr(so_module *mod, const char *symbol);
+uintptr_t so_find_addr_rx(so_module *mod, const char *symbol);
+// returns 0 instead of aborting when the symbol is missing
+uintptr_t so_try_find_addr_rx(so_module *mod, const char *symbol);
 DynLibFunction *so_find_import(DynLibFunction *funcs, int num_funcs, const char *name);
-void so_finalize(void);
-int so_unload(void);
+void so_finalize(so_module *mod);
+int so_unload(so_module *mod);
+
+// dl_iterate_phdr() replacement operating on all loaded modules;
+// required by the libunwind embedded in libc++_shared.so
+int so_dl_iterate_phdr(int (*callback)(void *info, size_t size, void *data), void *data);
 
 #endif

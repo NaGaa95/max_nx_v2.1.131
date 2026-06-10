@@ -4,7 +4,14 @@
  *
  * This software may be modified and distributed under the terms
  * of the MIT license.  See the LICENSE file for details.
+ *
+ * 2.1.131 update: the table now serves both libGame.so and libc++_shared.so.
+ * C++ runtime symbols (std::*, __cxa_*) are NOT here -- they resolve
+ * module-to-module from libc++_shared.so. OpenAL and mpg123 are now imports
+ * of libGame.so instead of being statically linked, so they appear here.
  */
+
+#define _GNU_SOURCE // vasprintf and friends
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -23,16 +30,22 @@
 #include <semaphore.h>
 #include <setjmp.h>
 #include <time.h>
+#include <dirent.h>
+#include <locale.h>
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <sys/reent.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
+#include <AL/al.h>
+#include <AL/alc.h>
+#include <mpg123.h>
 #include <switch.h>
 
 #include "config.h"
 #include "so_util.h"
 #include "util.h"
+#include "libc_shim.h"
 
 extern uintptr_t __cxa_atexit;
 
@@ -40,13 +53,13 @@ extern uintptr_t __stack_chk_fail;
 
 static char *__ctype_ = (char *)&_ctype_;
 
-// this is supposed to be an array of FILEs, which have a different size in libMaxPayne
-// instead use it to determine whether it's trying to print to stdout/stderr
-static uint8_t fake_sF[3][0x100]; // stdout, stderr, stdin
-
 static uint64_t __stack_chk_guard_fake = 0x4242424242424242;
 
 FILE *stderr_fake = (FILE *)0x1337;
+
+// OpenAL hooks living in hooks/openal.c (frequency override + device capture)
+extern ALCcontext *alcCreateContextHook(ALCdevice *dev, const ALCint *unused);
+extern ALCdevice *alcOpenDeviceHook(const char *name);
 
 void __assert2(const char *file, int line, const char *func, const char *expr) {
   debugPrintf("assertion failed:\n%s:%d (%s): %s\n", file, line, func, expr);
@@ -67,19 +80,18 @@ int __android_log_print(int prio, const char *tag, const char *fmt, ...) {
   return 0;
 }
 
-int fake_fprintf(FILE *stream, const char *fmt, ...) {
-  int ret = 0;
+int __android_log_write(int prio, const char *tag, const char *text) {
+  debugPrintf("%s: %s\n", tag, text);
+  return 0;
+}
+
+int __android_log_vprint(int prio, const char *tag, const char *fmt, va_list va) {
 #ifdef DEBUG_LOG
-  va_list list;
   static char string[0x1000];
-
-  va_start(list, fmt);
-  ret = vsnprintf(string, sizeof(string), fmt, list);
-  va_end(list);
-
-  debugPrintf("%s", string);
+  vsnprintf(string, sizeof(string), fmt, va);
+  debugPrintf("%s: %s\n", tag, string);
 #endif
-  return ret;
+  return 0;
 }
 
 // pthread stuff
@@ -122,6 +134,18 @@ int pthread_mutex_lock_fake(pthread_mutex_t **uid) {
   }
   if (ret < 0) return ret;
   return pthread_mutex_lock(*uid);
+}
+
+int pthread_mutex_trylock_fake(pthread_mutex_t **uid) {
+  int ret = 0;
+  if (!*uid) {
+    ret = pthread_mutex_init_fake(uid, NULL);
+  } else if ((uintptr_t)*uid == 0x4000) {
+    int attr = 1; // recursive
+    ret = pthread_mutex_init_fake(uid, &attr);
+  }
+  if (ret < 0) return ret;
+  return pthread_mutex_trylock(*uid);
 }
 
 int pthread_mutex_unlock_fake(pthread_mutex_t **uid) {
@@ -233,23 +257,36 @@ void glTexParameteriHook(GLenum target, GLenum param, GLint val) {
 DynLibFunction dynlib_functions[] = {
   { "__sF", (uintptr_t)&fake_sF },
   { "__cxa_atexit", (uintptr_t)&__cxa_atexit },
+  { "__cxa_finalize", (uintptr_t)&ret0 },
+  { "__cxa_thread_atexit_impl", (uintptr_t)&__cxa_thread_atexit_impl_fake },
 
   { "stderr", (uintptr_t)&stderr_fake },
 
-  { "AAssetManager_open", (uintptr_t)&ret0 },
-  { "AAssetManager_fromJava", (uintptr_t)&ret0 },
-  { "AAsset_close", (uintptr_t)&ret0 },
-  { "AAsset_getLength", (uintptr_t)&ret0 },
-  { "AAsset_getRemainingLength", (uintptr_t)&ret0 },
-  { "AAsset_read", (uintptr_t)&ret0 },
-  { "AAsset_seek", (uintptr_t)&ret0 },
+  // AAssets are emulated over regular files relative to the game dir
+  { "AAssetManager_open", (uintptr_t)&AAssetManager_open_fake },
+  { "AAssetManager_fromJava", (uintptr_t)&AAssetManager_fromJava_fake },
+  { "AAsset_close", (uintptr_t)&AAsset_close_fake },
+  { "AAsset_getLength", (uintptr_t)&AAsset_getLength_fake },
+  { "AAsset_getLength64", (uintptr_t)&AAsset_getLength64_fake },
+  { "AAsset_getRemainingLength", (uintptr_t)&AAsset_getRemainingLength_fake },
+  { "AAsset_getRemainingLength64", (uintptr_t)&AAsset_getRemainingLength64_fake },
+  { "AAsset_read", (uintptr_t)&AAsset_read_fake },
+  { "AAsset_seek", (uintptr_t)&AAsset_seek_fake },
+  { "AAsset_seek64", (uintptr_t)&AAsset_seek64_fake },
 
-  // Not sure how important this is. Used in some init_array.
-  { "pthread_key_create", (uintptr_t)&ret0 },
-  { "pthread_key_delete", (uintptr_t)&ret0 },
+  // ANativeWindow maps onto the default NWindow
+  { "ANativeWindow_fromSurface", (uintptr_t)&ANativeWindow_fromSurface_fake },
+  { "ANativeWindow_getWidth", (uintptr_t)&ANativeWindow_getWidth_fake },
+  { "ANativeWindow_getHeight", (uintptr_t)&ANativeWindow_getHeight_fake },
+  { "ANativeWindow_release", (uintptr_t)&ANativeWindow_release_fake },
+  { "ANativeWindow_setBuffersGeometry", (uintptr_t)&ANativeWindow_setBuffersGeometry_fake },
 
-  { "pthread_getspecific", (uintptr_t)&ret0 },
-  { "pthread_setspecific", (uintptr_t)&ret0 },
+  // newlib pthread keys are functional, and libc++_shared needs them
+  // for emulated thread_local storage
+  { "pthread_key_create", (uintptr_t)&pthread_key_create },
+  { "pthread_key_delete", (uintptr_t)&pthread_key_delete },
+  { "pthread_getspecific", (uintptr_t)&pthread_getspecific },
+  { "pthread_setspecific", (uintptr_t)&pthread_setspecific },
 
   { "pthread_cond_broadcast", (uintptr_t)&pthread_cond_broadcast_fake },
   { "pthread_cond_destroy", (uintptr_t)&pthread_cond_destroy_fake },
@@ -260,9 +297,17 @@ DynLibFunction dynlib_functions[] = {
 
   { "pthread_create", (uintptr_t)&pthread_create_fake },
   { "pthread_join", (uintptr_t)&pthread_join },
+  { "pthread_detach", (uintptr_t)&pthread_detach },
   { "pthread_self", (uintptr_t)&pthread_self },
 
   { "pthread_setschedparam", (uintptr_t)&ret0 },
+  { "pthread_setname_np", (uintptr_t)&ret0 },
+
+  { "pthread_attr_init", (uintptr_t)&ret0 },
+  { "pthread_attr_destroy", (uintptr_t)&ret0 },
+  { "pthread_attr_setschedparam", (uintptr_t)&ret0 },
+  { "pthread_attr_getschedparam", (uintptr_t)&pthread_attr_getschedparam_fake },
+  { "pthread_attr_getstacksize", (uintptr_t)&pthread_attr_getstacksize_fake },
 
   { "pthread_mutexattr_init", (uintptr_t)&ret0 },
   { "pthread_mutexattr_settype", (uintptr_t)&ret0 },
@@ -270,13 +315,29 @@ DynLibFunction dynlib_functions[] = {
   { "pthread_mutex_destroy", (uintptr_t)&pthread_mutex_destroy_fake },
   { "pthread_mutex_init", (uintptr_t)&pthread_mutex_init_fake },
   { "pthread_mutex_lock", (uintptr_t)&pthread_mutex_lock_fake },
+  { "pthread_mutex_trylock", (uintptr_t)&pthread_mutex_trylock_fake },
   { "pthread_mutex_unlock", (uintptr_t)&pthread_mutex_unlock_fake },
 
   { "pthread_once", (uintptr_t)&pthread_once_fake },
 
+  { "pthread_rwlock_rdlock", (uintptr_t)&pthread_rwlock_rdlock_fake },
+  { "pthread_rwlock_wrlock", (uintptr_t)&pthread_rwlock_wrlock_fake },
+  { "pthread_rwlock_unlock", (uintptr_t)&pthread_rwlock_unlock_fake },
+
+  { "sem_init", (uintptr_t)&sem_init_fake },
+  { "sem_destroy", (uintptr_t)&sem_destroy_fake },
+  { "sem_post", (uintptr_t)&sem_post_fake },
+  { "sem_wait", (uintptr_t)&sem_wait_fake },
+  { "sem_trywait", (uintptr_t)&sem_trywait_fake },
+  { "sem_getvalue", (uintptr_t)&sem_getvalue_fake },
+
   { "sched_get_priority_min", (uintptr_t)&retm1 },
+  { "sched_get_priority_max", (uintptr_t)&sched_get_priority_max_fake },
 
   { "__android_log_print", (uintptr_t)__android_log_print },
+  { "__android_log_write", (uintptr_t)__android_log_write },
+  { "__android_log_vprint", (uintptr_t)__android_log_vprint },
+  { "android_set_abort_message", (uintptr_t)&android_set_abort_message_fake },
 
   { "__errno", (uintptr_t)&__errno },
 
@@ -285,6 +346,27 @@ DynLibFunction dynlib_functions[] = {
   { "__stack_chk_guard", (uintptr_t)&__stack_chk_guard_fake },
 
   { "_ctype_", (uintptr_t)&__ctype_ },
+  { "__ctype_get_mb_cur_max", (uintptr_t)&__ctype_get_mb_cur_max_fake },
+
+  { "__register_atfork", (uintptr_t)&__register_atfork_fake },
+  { "__system_property_get", (uintptr_t)&__system_property_get_fake },
+  { "getauxval", (uintptr_t)&getauxval_fake },
+  { "gettid", (uintptr_t)&gettid_fake },
+  { "syscall", (uintptr_t)&syscall_fake },
+  { "dl_iterate_phdr", (uintptr_t)&so_dl_iterate_phdr },
+
+  // fortify wrappers
+  { "__memcpy_chk", (uintptr_t)&__memcpy_chk_fake },
+  { "__memmove_chk", (uintptr_t)&__memmove_chk_fake },
+  { "__strcat_chk", (uintptr_t)&__strcat_chk_fake },
+  { "__strchr_chk", (uintptr_t)&__strchr_chk_fake },
+  { "__strcpy_chk", (uintptr_t)&__strcpy_chk_fake },
+  { "__strlen_chk", (uintptr_t)&__strlen_chk_fake },
+  { "__strncat_chk", (uintptr_t)&__strncat_chk_fake },
+  { "__strncpy_chk", (uintptr_t)&__strncpy_chk_fake },
+  { "__strncpy_chk2", (uintptr_t)&__strncpy_chk2_fake },
+  { "__vsnprintf_chk", (uintptr_t)&__vsnprintf_chk_fake },
+  { "__vsprintf_chk", (uintptr_t)&__vsprintf_chk_fake },
 
    // TODO: use math neon?
   { "acos", (uintptr_t)&acos },
@@ -305,6 +387,7 @@ DynLibFunction dynlib_functions[] = {
   { "powf", (uintptr_t)&powf },
   { "sin", (uintptr_t)&sin },
   { "sinf", (uintptr_t)&sinf },
+  { "sincosf", (uintptr_t)&sincosf_fake },
   { "tan", (uintptr_t)&tan },
   { "tanf", (uintptr_t)&tanf },
   { "sqrt", (uintptr_t)&sqrt },
@@ -322,6 +405,7 @@ DynLibFunction dynlib_functions[] = {
   { "free", (uintptr_t)&free },
   { "malloc", (uintptr_t)&malloc },
   { "realloc", (uintptr_t)&realloc },
+  { "posix_memalign", (uintptr_t)&posix_memalign_fake },
 
   { "clock_gettime", (uintptr_t)&clock_gettime },
   { "gettimeofday", (uintptr_t)&gettimeofday },
@@ -330,31 +414,107 @@ DynLibFunction dynlib_functions[] = {
   { "localtime", (uintptr_t)&localtime },
   { "localtime_r", (uintptr_t)&localtime_r },
   { "strftime", (uintptr_t)&strftime },
+  { "strftime_l", (uintptr_t)&strftime_l_fake },
+  { "nanosleep", (uintptr_t)&nanosleep },
+  { "usleep", (uintptr_t)&usleep },
 
+  // EGL: the game creates and manages its own context now
   { "eglGetProcAddress", (uintptr_t)&eglGetProcAddress },
   { "eglGetDisplay", (uintptr_t)&eglGetDisplay },
   { "eglQueryString", (uintptr_t)&eglQueryString },
+  { "eglInitialize", (uintptr_t)&eglInitialize },
+  { "eglChooseConfig", (uintptr_t)&eglChooseConfig },
+  { "eglGetConfigAttrib", (uintptr_t)&eglGetConfigAttrib },
+  { "eglCreateContext", (uintptr_t)&eglCreateContext },
+  { "eglCreateWindowSurface", (uintptr_t)&eglCreateWindowSurface },
+  { "eglDestroySurface", (uintptr_t)&eglDestroySurface },
+  { "eglDestroyContext", (uintptr_t)&eglDestroyContext },
+  { "eglMakeCurrent", (uintptr_t)&eglMakeCurrent },
+  { "eglSwapBuffers", (uintptr_t)&eglSwapBuffers },
+  { "eglSwapInterval", (uintptr_t)&eglSwapInterval },
+  { "eglGetError", (uintptr_t)&eglGetError },
+  { "eglTerminate", (uintptr_t)&eglTerminate },
+  { "eglBindAPI", (uintptr_t)&eglBindAPI },
+
+  // OpenAL: imported by libGame.so since 2.x; alcOpenDevice/alcCreateContext
+  // go through hooks for the 44100hz override
+  { "alBufferData", (uintptr_t)&alBufferData },
+  { "alDeleteBuffers", (uintptr_t)&alDeleteBuffers },
+  { "alDeleteSources", (uintptr_t)&alDeleteSources },
+  { "alDistanceModel", (uintptr_t)&alDistanceModel },
+  { "alGenBuffers", (uintptr_t)&alGenBuffers },
+  { "alGenSources", (uintptr_t)&alGenSources },
+  { "alGetEnumValue", (uintptr_t)&alGetEnumValue },
+  { "alGetError", (uintptr_t)&alGetError },
+  { "alGetSourcef", (uintptr_t)&alGetSourcef },
+  { "alGetSourcei", (uintptr_t)&alGetSourcei },
+  { "alGetString", (uintptr_t)&alGetString },
+  { "alIsExtensionPresent", (uintptr_t)&alIsExtensionPresent },
+  { "alListener3f", (uintptr_t)&alListener3f },
+  { "alListenerf", (uintptr_t)&alListenerf },
+  { "alListenerfv", (uintptr_t)&alListenerfv },
+  { "alSource3f", (uintptr_t)&alSource3f },
+  { "alSourcePause", (uintptr_t)&alSourcePause },
+  { "alSourcePlay", (uintptr_t)&alSourcePlay },
+  { "alSourceQueueBuffers", (uintptr_t)&alSourceQueueBuffers },
+  { "alSourceStop", (uintptr_t)&alSourceStop },
+  { "alSourceUnqueueBuffers", (uintptr_t)&alSourceUnqueueBuffers },
+  { "alSourcef", (uintptr_t)&alSourcef },
+  { "alSourcei", (uintptr_t)&alSourcei },
+  { "alcCloseDevice", (uintptr_t)&alcCloseDevice },
+  { "alcCreateContext", (uintptr_t)&alcCreateContextHook },
+  { "alcDestroyContext", (uintptr_t)&alcDestroyContext },
+  { "alcGetError", (uintptr_t)&alcGetError },
+  { "alcGetString", (uintptr_t)&alcGetString },
+  { "alcMakeContextCurrent", (uintptr_t)&alcMakeContextCurrent },
+  { "alcOpenDevice", (uintptr_t)&alcOpenDeviceHook },
+
+  // mpg123 (music streaming); was libVendor_mpg123.so on Android,
+  // provided natively by the switch-mpg123 portlib here
+  { "mpg123_delete", (uintptr_t)&mpg123_delete },
+  { "mpg123_exit", (uintptr_t)&mpg123_exit },
+  { "mpg123_feed", (uintptr_t)&mpg123_feed },
+  { "mpg123_feedseek", (uintptr_t)&mpg123_feedseek },
+  { "mpg123_format_all", (uintptr_t)&mpg123_format_all },
+  { "mpg123_getformat", (uintptr_t)&mpg123_getformat },
+  { "mpg123_info", (uintptr_t)&mpg123_info },
+  { "mpg123_init", (uintptr_t)&mpg123_init },
+  { "mpg123_new", (uintptr_t)&mpg123_new },
+  { "mpg123_open_feed", (uintptr_t)&mpg123_open_feed },
+  { "mpg123_outblock", (uintptr_t)&mpg123_outblock },
+  { "mpg123_read", (uintptr_t)&mpg123_read },
 
   { "abort", (uintptr_t)&abort },
   { "exit", (uintptr_t)&exit },
 
-  { "fopen", (uintptr_t)&fopen },
-  { "fclose", (uintptr_t)&fclose },
+  { "fopen", (uintptr_t)&fopen_fake },
+  { "fclose", (uintptr_t)&fclose_fake },
   { "fdopen", (uintptr_t)&fdopen },
-  { "fflush", (uintptr_t)&fflush },
+  { "fflush", (uintptr_t)&fflush_fake },
   { "fgetc", (uintptr_t)&fgetc },
   { "fgets", (uintptr_t)&fgets },
-  { "fputs", (uintptr_t)&fputs },
-  { "fputc", (uintptr_t)&fputc },
-  { "fprintf", (uintptr_t)&fprintf },
-  { "fread", (uintptr_t)&fread },
-  { "fseek", (uintptr_t)&fseek },
+  { "fputs", (uintptr_t)&fputs_fake },
+  { "fputc", (uintptr_t)&fputc_fake },
+  { "fprintf", (uintptr_t)&fprintf_fake },
+  { "vfprintf", (uintptr_t)&vfprintf_fake },
+  { "fread", (uintptr_t)&fread_fake },
+  { "fseek", (uintptr_t)&fseek_fake },
+  { "fseeko", (uintptr_t)&fseeko },
   { "ftell", (uintptr_t)&ftell },
-  { "fwrite", (uintptr_t)&fwrite },
-  { "fstat", (uintptr_t)&fstat },
-  { "ferror", (uintptr_t)&ferror },
+  { "ftello", (uintptr_t)&ftello },
+  { "fwrite", (uintptr_t)&fwrite_fake },
+  { "fstat", (uintptr_t)&fstat_fake },
+  { "ferror", (uintptr_t)&ferror_fake },
   { "feof", (uintptr_t)&feof },
+  { "fileno", (uintptr_t)&fileno_fake },
+  { "ftruncate", (uintptr_t)&ftruncate },
   { "setvbuf", (uintptr_t)&setvbuf },
+  { "setbuf", (uintptr_t)&setbuf_fake },
+  { "getc", (uintptr_t)&getc_fake },
+  { "ungetc", (uintptr_t)&ungetc_fake },
+  { "getwc", (uintptr_t)&getwc },
+  { "ungetwc", (uintptr_t)&ungetwc },
+  { "fputwc", (uintptr_t)&fputwc },
 
   { "getenv", (uintptr_t)&getenv },
 
@@ -373,6 +533,7 @@ DynLibFunction dynlib_functions[] = {
   { "glClearColor", (uintptr_t)&glClearColor },
   { "glClearDepthf", (uintptr_t)&glClearDepthf },
   { "glClearStencil", (uintptr_t)&glClearStencil },
+  { "glColorMask", (uintptr_t)&glColorMask },
   { "glCompileShader", (uintptr_t)&glCompileShader },
   { "glCompressedTexImage2D", (uintptr_t)&glCompressedTexImage2D },
   { "glCreateProgram", (uintptr_t)&glCreateProgram },
@@ -412,6 +573,8 @@ DynLibFunction dynlib_functions[] = {
   { "glGetString", (uintptr_t)&glGetString },
   { "glGetUniformLocation", (uintptr_t)&glGetUniformLocation },
   { "glHint", (uintptr_t)&glHint },
+  { "glIsEnabled", (uintptr_t)&glIsEnabled },
+  { "glIsTexture", (uintptr_t)&glIsTexture },
   { "glLinkProgram", (uintptr_t)&glLinkProgram },
   { "glPolygonOffset", (uintptr_t)&glPolygonOffset },
   { "glReadPixels", (uintptr_t)&glReadPixels },
@@ -438,9 +601,11 @@ DynLibFunction dynlib_functions[] = {
   // this only uses setjmp in the JPEG loader but not longjmp
   // probably doesn't matter if they're compatible or not
   { "setjmp", (uintptr_t)&setjmp },
+  { "longjmp", (uintptr_t)&longjmp },
 
   { "memcmp", (uintptr_t)&memcmp },
   { "wmemcmp", (uintptr_t)&wmemcmp },
+  { "wmemchr", (uintptr_t)&wmemchr },
   { "memcpy", (uintptr_t)&memcpy },
   { "memmove", (uintptr_t)&memmove },
   { "memset", (uintptr_t)&memset },
@@ -455,25 +620,63 @@ DynLibFunction dynlib_functions[] = {
   { "sprintf", (uintptr_t)&sprintf },
   { "vsnprintf", (uintptr_t)&vsnprintf },
   { "vsprintf", (uintptr_t)&vsprintf },
+  { "vasprintf", (uintptr_t)&vasprintf },
 
   { "sscanf", (uintptr_t)&sscanf },
+  { "vsscanf", (uintptr_t)&vsscanf },
+  { "swprintf", (uintptr_t)&swprintf },
 
   { "close", (uintptr_t)&close },
   { "lseek", (uintptr_t)&lseek },
   { "mkdir", (uintptr_t)&mkdir },
-  { "open", (uintptr_t)&open },
+  { "open", (uintptr_t)&open_fake },
+  { "openat", (uintptr_t)&openat_fake },
   { "read", (uintptr_t)&read },
-  { "stat", (uintptr_t)stat },
   { "write", (uintptr_t)&write },
+  { "stat", (uintptr_t)&stat_fake },
+  { "lstat", (uintptr_t)&lstat_fake },
+  { "remove", (uintptr_t)&remove },
+  { "rename", (uintptr_t)&rename },
+  { "unlink", (uintptr_t)&unlink },
+  { "unlinkat", (uintptr_t)&unlinkat_fake },
+  { "truncate", (uintptr_t)&retm1 },
+  { "link", (uintptr_t)&retm1 },
+  { "symlink", (uintptr_t)&retm1 },
+  { "readlink", (uintptr_t)&retm1 },
+  { "chdir", (uintptr_t)&chdir },
+  { "getcwd", (uintptr_t)&getcwd },
+  { "realpath", (uintptr_t)&realpath_fake },
+  { "isatty", (uintptr_t)&isatty },
+  { "ioctl", (uintptr_t)&retm1 },
+  { "fchmod", (uintptr_t)&ret0 },
+  { "fchmodat", (uintptr_t)&ret0 },
+  { "utimensat", (uintptr_t)&ret0 },
+  { "sendfile", (uintptr_t)&retm1 },
+  { "statvfs", (uintptr_t)&statvfs_fake },
+  { "pathconf", (uintptr_t)&pathconf_fake },
+  { "sysconf", (uintptr_t)&sysconf_fake },
+
+  { "opendir", (uintptr_t)&opendir },
+  { "fdopendir", (uintptr_t)&ret0 },
+  { "closedir", (uintptr_t)&closedir },
+  { "readdir", (uintptr_t)&readdir_fake },
+  { "readdir64", (uintptr_t)&readdir_fake },
+
+  { "openlog", (uintptr_t)&ret0 },
+  { "closelog", (uintptr_t)&ret0 },
+  { "syslog", (uintptr_t)&ret0 },
 
   { "strcasecmp", (uintptr_t)&strcasecmp },
   { "strcat", (uintptr_t)&strcat },
   { "strchr", (uintptr_t)&strchr },
   { "strcmp", (uintptr_t)&strcmp },
   { "strcoll", (uintptr_t)&strcoll },
+  { "strcoll_l", (uintptr_t)&strcoll_l_fake },
   { "strcpy", (uintptr_t)&strcpy },
   { "stpcpy", (uintptr_t)&stpcpy },
+  { "strdup", (uintptr_t)&strdup },
   { "strerror", (uintptr_t)&strerror },
+  { "strerror_r", (uintptr_t)&strerror_r_fake },
   { "strlen", (uintptr_t)&strlen },
   { "strncasecmp", (uintptr_t)&strncasecmp },
   { "strncat", (uintptr_t)&strncat },
@@ -487,13 +690,38 @@ DynLibFunction dynlib_functions[] = {
   { "strtol", (uintptr_t)&strtol },
   { "strtoul", (uintptr_t)&strtoul },
   { "strtof", (uintptr_t)&strtof },
+  { "strtold", (uintptr_t)&strtold },
+  { "strtold_l", (uintptr_t)&strtold_l_fake },
+  { "strtoll", (uintptr_t)&strtoll },
+  { "strtoll_l", (uintptr_t)&strtoll_l_fake },
+  { "strtoull", (uintptr_t)&strtoull },
+  { "strtoull_l", (uintptr_t)&strtoull_l_fake },
   { "strxfrm", (uintptr_t)&strxfrm },
+  { "strxfrm_l", (uintptr_t)&strxfrm_l_fake },
 
   { "srand", (uintptr_t)&srand },
   { "rand", (uintptr_t)&rand },
 
-  { "nanosleep", (uintptr_t)&nanosleep },
-  { "usleep", (uintptr_t)&usleep },
+  // locale: the _l variants ignore the locale and use the C locale
+  { "setlocale", (uintptr_t)&setlocale },
+  { "localeconv", (uintptr_t)&localeconv },
+  { "newlocale", (uintptr_t)&newlocale_fake },
+  { "freelocale", (uintptr_t)&freelocale_fake },
+  { "uselocale", (uintptr_t)&uselocale_fake },
+  { "iswalpha_l", (uintptr_t)&iswalpha_l_fake },
+  { "iswblank_l", (uintptr_t)&iswblank_l_fake },
+  { "iswcntrl_l", (uintptr_t)&iswcntrl_l_fake },
+  { "iswdigit_l", (uintptr_t)&iswdigit_l_fake },
+  { "iswlower_l", (uintptr_t)&iswlower_l_fake },
+  { "iswprint_l", (uintptr_t)&iswprint_l_fake },
+  { "iswpunct_l", (uintptr_t)&iswpunct_l_fake },
+  { "iswspace_l", (uintptr_t)&iswspace_l_fake },
+  { "iswupper_l", (uintptr_t)&iswupper_l_fake },
+  { "iswxdigit_l", (uintptr_t)&iswxdigit_l_fake },
+  { "towlower_l", (uintptr_t)&towlower_l_fake },
+  { "towupper_l", (uintptr_t)&towupper_l_fake },
+  { "wcscoll_l", (uintptr_t)&wcscoll_l_fake },
+  { "wcsxfrm_l", (uintptr_t)&wcsxfrm_l_fake },
 
   { "wctob", (uintptr_t)&wctob },
   { "wctype", (uintptr_t)&wctype },
@@ -502,9 +730,21 @@ DynLibFunction dynlib_functions[] = {
   { "wcscoll", (uintptr_t)&wcscoll },
   { "wcsftime", (uintptr_t)&wcsftime },
   { "mbrtowc", (uintptr_t)&mbrtowc },
+  { "mbrlen", (uintptr_t)&mbrlen },
+  { "mbtowc", (uintptr_t)&mbtowc },
+  { "mbsrtowcs", (uintptr_t)&mbsrtowcs },
+  { "mbsnrtowcs", (uintptr_t)&mbsnrtowcs_fake },
+  { "wcsnrtombs", (uintptr_t)&wcsnrtombs_fake },
   { "wcrtomb", (uintptr_t)&wcrtomb },
   { "wcslen", (uintptr_t)&wcslen },
   { "btowc", (uintptr_t)&btowc },
+  { "wcstod", (uintptr_t)&wcstod },
+  { "wcstof", (uintptr_t)&wcstof },
+  { "wcstol", (uintptr_t)&wcstol },
+  { "wcstold", (uintptr_t)&wcstold },
+  { "wcstoll", (uintptr_t)&wcstoll },
+  { "wcstoul", (uintptr_t)&wcstoul },
+  { "wcstoull", (uintptr_t)&wcstoull },
 };
 
 size_t dynlib_numfunctions = sizeof(dynlib_functions) / sizeof(*dynlib_functions);

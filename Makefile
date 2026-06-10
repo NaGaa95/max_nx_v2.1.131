@@ -39,6 +39,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 #---------------------------------------------------------------------------------
 TARGET		:=	$(notdir $(CURDIR))
 APP_TITLE	:=	Max Payne
+APP_VERSION	:=	1.0.1
 BUILD		:=	build
 SOURCES		:=	source source/hooks
 DATA		:=	data
@@ -60,7 +61,9 @@ CXXFLAGS	:= $(CFLAGS)
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
-LIBS	:= -lopenal -lSDL2 -lEGL -lGLESv2 -lglapi -ldrm_nouveau -lnx -lm
+# mpg123 is needed since 2.1.131 (music streaming used to be in libVendor_mpg123.so)
+# install it with: pacman -S switch-mpg123
+LIBS	:= -lopenal -lSDL2 -lmpg123 -lEGL -lGLESv2 -lglapi -ldrm_nouveau -lnx -lm
 
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing

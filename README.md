@@ -16,18 +16,18 @@ This requires access to the following system calls:
 I actually have no idea what that entails except the fact that you have to be running a CFW. Good luck.
 
 You're going to need:
-* `.apk` file for version 1.7 (latest version at the time of writing) that includes `arm64-v8a` libraries;
-* `.obb` file for version 1.6 or 1.7 (usually located at `/sdcard/android/obb/com.rockstar.maxpayne/main.3.com.rockstar.maxpayne.obb`).
+* `.apk` file for version 2.1.131 (the 2025/2026 update). There is no separate `.obb` anymore: all the game data now lives in the APK's `assets` folder.
 
-Both files [can be obtained](https://stackoverflow.com/questions/11012976/how-do-i-get-the-apk-of-an-installed-app-without-root-access) from your phone if you have a copy of the game installed.
-Both files can be opened or extracted with anything that can extract `.zip` files.
+The file [can be obtained](https://stackoverflow.com/questions/11012976/how-do-i-get-the-apk-of-an-installed-app-without-root-access) from your phone if you have a copy of the game installed.
+It can be opened or extracted with anything that can extract `.zip` files.
 
 To install:
 1. Create a folder called `maxpayne` in the `switch` folder on your SD card.
-2. Extract **the contents of** the `assets` folder from your `.apk` to `/switch/maxpayne/`.
-3. Extract `lib/arm64-v8a/libMaxPayne.so` from your `.apk` to `/switch/maxpayne/`.
-4. Extract the contents of the `.obb` file into `/switch/maxpayne/`. You can skip all the `.msf` files except for `MaxPayneSoundsv2.msf` and any extra languages that you want.
-5. Extract the contents of the `.zip` file from the latest release into `/switch/maxpayne/`. Replace everything.
+2. Extract **the contents of** the `assets` folder from your `.apk` to `/switch/maxpayne/` (this includes the `.msf` sound files, `x_*.ras` archives, `data`, `es2` etc.). You can skip all the `maxpaynesounds*.msf` files except `maxpaynesoundsv2.msf`, and all `x_<language>.ras` except `x_english.ras` plus any extra languages you want.
+3. Extract `lib/arm64-v8a/libGame.so` and `lib/arm64-v8a/libc++_shared.so` from your `.apk` to `/switch/maxpayne/`.
+4. Extract the contents of the `.zip` file from the latest release into `/switch/maxpayne/`. Replace everything.
+
+For porting status and technical notes about the 2.1.131 update see `PORT_NOTES_2.1.131.md`.
 
 ### Notes
 
@@ -39,8 +39,8 @@ For more detailed descriptions of said settings check the [wiki article](https:/
 
 The game will show an error message if it detects that anything is wrong. Please read those and check the relevant parts of your setup.
 
-If the error says `Could not find symbol ...`, that likely means you have the wrong `.apk` or `.so` file. You need version 1.7, others **will not work**.
-Make sure also that you've extracted `libMaxPayne.so` from the `arm64-v8a` subfolder.
+If the error says `Could not find symbol ...`, that likely means you have the wrong `.apk` or `.so` file. This branch targets version 2.1.131, others **will not work** (for 1.7 use the master branch).
+Make sure also that you've extracted `libGame.so` and `libc++_shared.so` from the `arm64-v8a` subfolder.
 
 If the game crashes on startup, please post an issue with your last crash report attached.
 
@@ -50,6 +50,7 @@ You're going to need devkitA64 and the following libraries:
 * `switch-mesa`
 * `switch-libdrm_nouveau`
 * `switch-sdl2`
+* `switch-mpg123`
 * `devkitpro-pkgbuild-helpers`
 * [openal-soft](https://github.com/fgsfdsfgs/openal-soft)
 
