@@ -30,6 +30,7 @@
 #include "config.h"
 #include "util.h"
 #include "movie_player.h"
+#include "font_atlas.h"
 
 // the ring must be deep enough to absorb the longest run of video packets
 // the muxer interleaves between audio packets (~0.5s), otherwise the decoder
@@ -101,6 +102,11 @@ static struct {
   GLint loc_pos, loc_uv, loc_tex[3];
   int tex_w, tex_h;
   int ready;
+  // text overlay (FPS counter)
+  GLuint text_prog;
+  GLuint text_tex;
+  GLint text_loc_pos, text_loc_uv, text_loc_tex, text_loc_off, text_loc_color;
+  int text_uploaded;
 } gl;
 
 // ---------------------------------------------------------------------------
@@ -320,6 +326,25 @@ static const char fshader_src[] =
   "  gl_FragColor = vec4(y + 1.402 * v, y - 0.344 * u - 0.714 * v, y + 1.772 * u, 1.0);\n"
   "}\n";
 
+static const char text_vshader_src[] =
+  "attribute vec2 aPos;\n"
+  "attribute vec2 aUV;\n"
+  "uniform vec2 uOff;\n"
+  "varying vec2 vUV;\n"
+  "void main() {\n"
+  "  vUV = aUV;\n"
+  "  gl_Position = vec4(aPos + uOff, 0.0, 1.0);\n"
+  "}\n";
+
+static const char text_fshader_src[] =
+  "precision mediump float;\n"
+  "uniform sampler2D texFont;\n"
+  "uniform vec4 uColor;\n"
+  "varying vec2 vUV;\n"
+  "void main() {\n"
+  "  gl_FragColor = vec4(uColor.rgb, uColor.a * texture2D(texFont, vUV).r);\n"
+  "}\n";
+
 static GLuint compile_shader(GLenum type, const char *src) {
   GLuint s = glCreateShader(type);
   glShaderSource(s, 1, &src, NULL);
@@ -356,6 +381,32 @@ static int gl_init(void) {
   gl.loc_tex[1] = glGetUniformLocation(gl.prog, "texU");
   gl.loc_tex[2] = glGetUniformLocation(gl.prog, "texV");
   glGenTextures(3, gl.tex);
+
+  // text overlay program; the atlas itself is uploaded lazily from the
+  // render path so gl_init doesn't perturb the game's texture bindings
+  const GLuint tvs = compile_shader(GL_VERTEX_SHADER, text_vshader_src);
+  const GLuint tfs = compile_shader(GL_FRAGMENT_SHADER, text_fshader_src);
+  gl.text_prog = glCreateProgram();
+  glAttachShader(gl.text_prog, tvs);
+  glAttachShader(gl.text_prog, tfs);
+  glLinkProgram(gl.text_prog);
+  glDeleteShader(tvs);
+  glDeleteShader(tfs);
+  ok = 0;
+  glGetProgramiv(gl.text_prog, GL_LINK_STATUS, &ok);
+  if (ok) {
+    gl.text_loc_pos = glGetAttribLocation(gl.text_prog, "aPos");
+    gl.text_loc_uv = glGetAttribLocation(gl.text_prog, "aUV");
+    gl.text_loc_tex = glGetUniformLocation(gl.text_prog, "texFont");
+    gl.text_loc_off = glGetUniformLocation(gl.text_prog, "uOff");
+    gl.text_loc_color = glGetUniformLocation(gl.text_prog, "uColor");
+    glGenTextures(1, &gl.text_tex);
+  } else {
+    debugPrintf("movie: text program link failed, text overlay disabled\n");
+    glDeleteProgram(gl.text_prog);
+    gl.text_prog = 0;
+  }
+
   gl.ready = 1;
   return 1;
 }
@@ -387,6 +438,174 @@ static void gl_upload_frame(const VideoFrame *f) {
     gl.tex_w = mp.width;
     gl.tex_h = mp.height;
   }
+}
+
+// uploads the glyph atlas on first use; binds texture unit 0 in the process,
+// so only call this inside a texture-state save/restore region
+static void text_atlas_ready(void) {
+  if (gl.text_uploaded)
+    return;
+  GLint prev_align = 4;
+  glGetIntegerv(GL_UNPACK_ALIGNMENT, &prev_align);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, gl.text_tex);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, FONT_ATLAS_W, FONT_ATLAS_H, 0,
+               GL_LUMINANCE, GL_UNSIGNED_BYTE, font_atlas);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, prev_align);
+  gl.text_uploaded = 1;
+}
+
+// two triangles per glyph into verts (x,y,u,v interleaved); spaces advance
+// the pen without emitting geometry
+static int text_emit_line(const char *text, int start, int len, float x, float y,
+                          float gw, float gh, GLfloat *verts, int quads) {
+  for (int j = 0; j < len; j++) {
+    const char c = text[start + j];
+    if (c == ' ')
+      continue;
+    const int idx = c - FONT_FIRST;
+    const float u0 = (float)((idx % FONT_COLS) * FONT_CELL_W) / (float)FONT_ATLAS_W;
+    const float v0 = (float)((idx / FONT_COLS) * FONT_CELL_H) / (float)FONT_ATLAS_H;
+    const float u1 = u0 + (float)FONT_CELL_W / (float)FONT_ATLAS_W;
+    const float v1 = v0 + (float)FONT_CELL_H / (float)FONT_ATLAS_H;
+    const float gx = x + j * gw;
+    const float x0 = gx * 2.0f / (float)screen_width - 1.0f;
+    const float x1 = (gx + gw) * 2.0f / (float)screen_width - 1.0f;
+    const float y0 = 1.0f - y * 2.0f / (float)screen_height;
+    const float y1 = 1.0f - (y + gh) * 2.0f / (float)screen_height;
+    const GLfloat quad[24] = {
+      x0, y0, u0, v0,  x1, y0, u1, v0,  x0, y1, u0, v1,
+      x1, y0, u1, v0,  x1, y1, u1, v1,  x0, y1, u0, v1,
+    };
+    memcpy(verts + quads * 24, quad, sizeof(quad));
+    quads++;
+  }
+  return quads;
+}
+
+// ---------------------------------------------------------------------------
+// FPS counter (config.show_fps): counts presented frames and draws the rate
+// in the top left corner, refreshed twice a second. This runs outside
+// movie_render's guarded section, so it saves/restores all the GL state it
+// touches itself.
+// ---------------------------------------------------------------------------
+
+static struct {
+  u64 window_start;
+  u32 frames;
+  char text[8];
+} fps;
+
+static void fps_render(void) {
+  const u64 now = armGetSystemTick();
+  const u64 freq = armGetSystemTickFreq();
+  fps.frames++;
+  if (!fps.window_start)
+    fps.window_start = now;
+  if (now - fps.window_start >= freq / 2) {
+    const float rate = (float)fps.frames * (float)freq / (float)(now - fps.window_start);
+    snprintf(fps.text, sizeof(fps.text), "%.0f", rate);
+    fps.frames = 0;
+    fps.window_start = now;
+  }
+
+  if (!fps.text[0] || !gl_init() || !gl.text_prog)
+    return;
+
+  const float gh = (float)screen_height / 30.0f;
+  const float gw = gh * (float)FONT_CELL_W / (float)FONT_CELL_H;
+  static GLfloat verts[8 * 24];
+  const int quads = text_emit_line(fps.text, 0, (int)strlen(fps.text),
+                                   10.0f, 8.0f, gw, gh, verts, 0);
+  if (!quads)
+    return;
+
+  GLint prev_prog, prev_active, prev_tex0, prev_array_buf, prev_viewport[4];
+  GLint bsrc_rgb, bdst_rgb, bsrc_a, bdst_a;
+  const GLboolean prev_blend = glIsEnabled(GL_BLEND);
+  const GLboolean prev_depth = glIsEnabled(GL_DEPTH_TEST);
+  const GLboolean prev_scissor = glIsEnabled(GL_SCISSOR_TEST);
+  const GLboolean prev_cull = glIsEnabled(GL_CULL_FACE);
+  glGetIntegerv(GL_CURRENT_PROGRAM, &prev_prog);
+  glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
+  glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prev_array_buf);
+  glGetIntegerv(GL_VIEWPORT, prev_viewport);
+  glGetIntegerv(GL_BLEND_SRC_RGB, &bsrc_rgb);
+  glGetIntegerv(GL_BLEND_DST_RGB, &bdst_rgb);
+  glGetIntegerv(GL_BLEND_SRC_ALPHA, &bsrc_a);
+  glGetIntegerv(GL_BLEND_DST_ALPHA, &bdst_a);
+  glActiveTexture(GL_TEXTURE0);
+  glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex0);
+
+  // the game specifies its vertex attribs once and reuses them across
+  // frames (the menu goes black otherwise), so everything touched on the
+  // two indices gets captured and restored: enable flag, pointer, format
+  // and the VBO the pointer lives in
+  GLint pos_en, uv_en, pos_size, uv_size, pos_type, uv_type;
+  GLint pos_norm, uv_norm, pos_stride, uv_stride, pos_vbo, uv_vbo;
+  void *pos_ptr = NULL, *uv_ptr = NULL;
+  glGetVertexAttribiv(gl.text_loc_pos, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &pos_en);
+  glGetVertexAttribiv(gl.text_loc_pos, GL_VERTEX_ATTRIB_ARRAY_SIZE, &pos_size);
+  glGetVertexAttribiv(gl.text_loc_pos, GL_VERTEX_ATTRIB_ARRAY_TYPE, &pos_type);
+  glGetVertexAttribiv(gl.text_loc_pos, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &pos_norm);
+  glGetVertexAttribiv(gl.text_loc_pos, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &pos_stride);
+  glGetVertexAttribiv(gl.text_loc_pos, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &pos_vbo);
+  glGetVertexAttribPointerv(gl.text_loc_pos, GL_VERTEX_ATTRIB_ARRAY_POINTER, &pos_ptr);
+  glGetVertexAttribiv(gl.text_loc_uv, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &uv_en);
+  glGetVertexAttribiv(gl.text_loc_uv, GL_VERTEX_ATTRIB_ARRAY_SIZE, &uv_size);
+  glGetVertexAttribiv(gl.text_loc_uv, GL_VERTEX_ATTRIB_ARRAY_TYPE, &uv_type);
+  glGetVertexAttribiv(gl.text_loc_uv, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &uv_norm);
+  glGetVertexAttribiv(gl.text_loc_uv, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &uv_stride);
+  glGetVertexAttribiv(gl.text_loc_uv, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &uv_vbo);
+  glGetVertexAttribPointerv(gl.text_loc_uv, GL_VERTEX_ATTRIB_ARRAY_POINTER, &uv_ptr);
+
+  text_atlas_ready();
+  glDisable(GL_DEPTH_TEST);
+  glDisable(GL_SCISSOR_TEST);
+  glDisable(GL_CULL_FACE);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  glBindBuffer(GL_ARRAY_BUFFER, 0);
+  glViewport(0, 0, screen_width, screen_height);
+  glUseProgram(gl.text_prog);
+  glBindTexture(GL_TEXTURE_2D, gl.text_tex);
+  glUniform1i(gl.text_loc_tex, 0);
+  glEnableVertexAttribArray(gl.text_loc_pos);
+  glEnableVertexAttribArray(gl.text_loc_uv);
+  glVertexAttribPointer(gl.text_loc_pos, 2, GL_FLOAT, GL_FALSE, 16, verts);
+  glVertexAttribPointer(gl.text_loc_uv, 2, GL_FLOAT, GL_FALSE, 16, verts + 2);
+
+  glUniform2f(gl.text_loc_off, 3.0f / (float)screen_width, -3.0f / (float)screen_height);
+  glUniform4f(gl.text_loc_color, 0.0f, 0.0f, 0.0f, 0.9f);
+  glDrawArrays(GL_TRIANGLES, 0, quads * 6);
+  glUniform2f(gl.text_loc_off, 0.0f, 0.0f);
+  glUniform4f(gl.text_loc_color, 1.0f, 1.0f, 1.0f, 1.0f);
+  glDrawArrays(GL_TRIANGLES, 0, quads * 6);
+
+  // re-specify the previous attrib pointers (each lives in whatever VBO
+  // was bound when the game set it), then the previous enable state
+  glBindBuffer(GL_ARRAY_BUFFER, pos_vbo);
+  glVertexAttribPointer(gl.text_loc_pos, pos_size, pos_type, (GLboolean)pos_norm, pos_stride, pos_ptr);
+  glBindBuffer(GL_ARRAY_BUFFER, uv_vbo);
+  glVertexAttribPointer(gl.text_loc_uv, uv_size, uv_type, (GLboolean)uv_norm, uv_stride, uv_ptr);
+  if (!pos_en) glDisableVertexAttribArray(gl.text_loc_pos);
+  if (!uv_en) glDisableVertexAttribArray(gl.text_loc_uv);
+
+  glBlendFuncSeparate(bsrc_rgb, bdst_rgb, bsrc_a, bdst_a);
+  if (!prev_blend) glDisable(GL_BLEND);
+  if (prev_depth) glEnable(GL_DEPTH_TEST);
+  if (prev_scissor) glEnable(GL_SCISSOR_TEST);
+  if (prev_cull) glEnable(GL_CULL_FACE);
+  glBindTexture(GL_TEXTURE_2D, prev_tex0);
+  glActiveTexture(prev_active);
+  glUseProgram(prev_prog);
+  glBindBuffer(GL_ARRAY_BUFFER, prev_array_buf);
+  glViewport(prev_viewport[0], prev_viewport[1], prev_viewport[2], prev_viewport[3]);
 }
 
 static void movie_render(void) {
@@ -498,6 +717,8 @@ static volatile unsigned int game_swaps = 0;
 unsigned int eglSwapBuffersHook(void *display, void *surface) {
   if (mp.active)
     movie_render();
+  if (config.show_fps)
+    fps_render();
   game_swaps++;
   // loading screens present from inside a single long draw call; this is
   // where the loading CPU boost gets engaged (see main.c)
@@ -530,6 +751,8 @@ void movie_main_loop_tick(void) {
     return;
   }
   movie_render();
+  if (config.show_fps)
+    fps_render();
   eglSwapBuffers(d, s);
 }
 
