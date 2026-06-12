@@ -37,8 +37,9 @@ include $(DEVKITPRO)/libnx/switch_rules
 #   of a homebrew executable (.nro). This is intended to be used for sysmodules.
 #   NACP building is skipped as well.
 #---------------------------------------------------------------------------------
-TARGET		:=	$(notdir $(CURDIR))
+TARGET		:=	max_nx
 APP_TITLE	:=	Max Payne
+APP_AUTHOR	:=	naga
 APP_VERSION	:=	1.0.1
 BUILD		:=	build
 SOURCES		:=	source source/hooks
