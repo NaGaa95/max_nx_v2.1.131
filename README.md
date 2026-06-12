@@ -1,4 +1,10 @@
-## Max Payne Mobile Nintendo Switch port
+<div align=center>
+
+<img src="extras/banner.png" alt="Banner" width="50%">
+
+</div>
+
+<h1 align=center>Max Payne Mobile - Nintendo Switch port</h1>
 
 This is a wrapper/port of the Android version of Max Payne Mobile. It loads the original game binary, patches it and runs it.
 It's basically as if we emulate a minimalist Android environment in which we natively run the original Android binary as is.
@@ -67,6 +73,12 @@ make
 * Rinnegatamante, Bythos, frangarcj, CBPS for help with the PS Vita port;
 * Freakler for providing the icon;
 * Switchbrew for libnx.
+  
+### Support
+
+If you enjoy my work and want to support me:
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/D1D1P2MOG)
 
 ### Legal
 
